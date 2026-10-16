@@ -51,7 +51,7 @@ from ultralytics import YOLO
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Default Production Weights
-DEFAULT_ROAD_MODEL = "convnext_road_model_v2.pth"
+DEFAULT_ROAD_MODEL = "classifier.pth" if os.path.exists("classifier.pth") else "convnext_road_model_v2.pth"
 DEFAULT_DET_MODEL  = "detector.pt"
 DEFAULT_SEG_MODEL  = "segmentor.pt"
 
@@ -384,11 +384,14 @@ class YoloInferenceEngine:
     def predict_batch(
         self,
         images: List[np.ndarray],
-        conf_thresholds: Optional[Dict[str, float]] = None
+        conf_thresholds: Optional[Dict[str, float]] = None,
+        candidate_floor: Optional[float] = None
     ) -> List[List[Dict[str, Any]]]:
         """
         Runs YOLO detection/segmentation on a batch of perspective view numpy images.
         Returns a list of detection records per view (Spec §4 requirement).
+        If candidate_floor is provided, detections between candidate_floor and class threshold
+        are tagged with is_candidate=True for two-tier tracking hysteresis.
         """
         if not images:
             return []
@@ -406,11 +409,12 @@ class YoloInferenceEngine:
             thresholds["garbage"] = thresholds["trash"]
 
         min_conf = min(thresholds.values())
+        infer_conf = min(min_conf, candidate_floor) if (candidate_floor is not None and candidate_floor > 0) else min_conf
 
         # Batched inference call with exact 1024 imgsz resolution
         results = self.model.predict(
             images,
-            conf=min_conf,
+            conf=infer_conf,
             iou=self.iou,
             imgsz=TRAIN_IMGSZ,
             augment=self.augment,
@@ -460,10 +464,14 @@ class YoloInferenceEngine:
                     if label == "drainage" and subtype not in {"open", "broken", "covered"}:
                         continue
 
-                    # Filter by per-class confidence threshold
+                    # Filter by per-class confidence threshold or candidate floor
                     class_conf_thresh = thresholds.get(label, 0.25)
+                    is_candidate = False
                     if raw_conf < class_conf_thresh:
-                        continue
+                        if candidate_floor is not None and raw_conf >= candidate_floor:
+                            is_candidate = True
+                        else:
+                            continue
 
                     x1, y1, x2, y2 = [float(v) for v in box.xyxy[0].tolist()]
 
@@ -478,6 +486,8 @@ class YoloInferenceEngine:
                         "box_1000": [ymin, xmin, ymax, xmax],
                         "confidence": round(raw_conf, 2),
                     }
+                    if is_candidate:
+                        det_record["is_candidate"] = True
                     if subtype:
                         det_record["subtype"] = subtype
 
@@ -517,6 +527,8 @@ def annotate_perspective_view(
 
     # Draw segmentation masks & bounding boxes
     for det in detections:
+        if det.get("is_candidate"):
+            continue
         label = det["label"]
         subtype = det.get("subtype")
         conf = det.get("confidence", 0.0)

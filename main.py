@@ -21,6 +21,7 @@ import os
 import re
 import sys
 import logging
+from collections import Counter
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone, timedelta
 from fractions import Fraction
@@ -33,13 +34,17 @@ import numpy as np
 from PIL import Image, ExifTags
 import torch
 
-from temporal_gating import gate_sequence, summarize as gating_summary
+try:
+    from temporal_gating import gate_sequence, summarize as gating_summary
+except ImportError:
+    gate_sequence, gating_summary = None, None
 from inference_engine import (
     ConvNeXtRoadClassifier,
     MobileNetRoadClassifier,
     YoloInferenceEngine,
     annotate_perspective_view
 )
+from track_interpolator import TemporalTrackInterpolator, annotate_interpolated_on_image
 
 # ── VIEW CONFIGURATIONS (§2 Spec Table) ──
 # -- GEOMETRY MUST MATCH split_views.py (the training-crop generator) --
@@ -227,6 +232,171 @@ def detection_bearing(det, view_name, projector):
         np.array([[cx, cy]], dtype=np.float32),
         cfg["yaw"], cfg["pitch"], cfg["fov"], 360.0, 180.0)
     return float(uv[0, 0]) - 180.0, 90.0 - float(uv[0, 1])
+
+
+def apply_intra_view_nms(detections: List[Dict[str, Any]], iou_thresh: float = 0.65) -> List[Dict[str, Any]]:
+    """
+    Suppresses redundant overlapping detections of the same label & subtype within a single view.
+    Prioritizes:
+      1. Confirmed detections over weak candidates (not is_candidate).
+      2. Polygon segmentation masks over bounding-box-only detections.
+      3. Higher confidence score.
+    """
+    if len(detections) <= 1:
+        return detections
+
+    sorted_dets = sorted(
+        detections,
+        key=lambda d: (
+            not d.get("is_candidate", False),
+            "_polygon_norm" in d and len(d.get("_polygon_norm", [])) >= 3,
+            d.get("confidence", 0.0)
+        ),
+        reverse=True
+    )
+
+    kept: List[Dict[str, Any]] = []
+    for d in sorted_dets:
+        b1 = d["box_1000"]
+        lbl1 = d["label"]
+        st1 = d.get("subtype")
+
+        is_dup = False
+        for k in kept:
+            if k["label"] == lbl1 and k.get("subtype") == st1:
+                b2 = k["box_1000"]
+                inter_ymin = max(b1[0], b2[0])
+                inter_xmin = max(b1[1], b2[1])
+                inter_ymax = min(b1[2], b2[2])
+                inter_xmax = min(b1[3], b2[3])
+                if inter_ymax > inter_ymin and inter_xmax > inter_xmin:
+                    inter_area = (inter_ymax - inter_ymin) * (inter_xmax - inter_xmin)
+                    area1 = max(1, (b1[2] - b1[0]) * (b1[3] - b1[1]))
+                    area2 = max(1, (b2[2] - b2[0]) * (b2[3] - b2[1]))
+                    union_area = area1 + area2 - inter_area
+                    iou = inter_area / union_area if union_area > 0 else 0.0
+                    if iou > iou_thresh:
+                        is_dup = True
+                        break
+        if not is_dup:
+            kept.append(d)
+
+    return kept
+
+
+def smooth_road_surface_sequence(records: List[Dict[str, Any]], window_size: int = 5) -> None:
+    """
+    Smoothes momentary 1-2 frame road surface classification flickers (e.g. noise fallback to dirt)
+    using a sliding window majority vote over adjacent frames.
+    """
+    if len(records) < 3:
+        return
+
+    n = len(records)
+    original_types = [r["road_type"]["road_type"] for r in records]
+    confs = [r["road_type"].get("confidence", 0.0) for r in records]
+    fallbacks = [r["road_type"].get("fallback_used", False) for r in records]
+
+    for i in range(n):
+        # Only smooth frames that were low-confidence or noise fallbacks
+        if not fallbacks[i] and confs[i] >= 0.70:
+            continue
+
+        start_idx = max(0, i - window_size // 2)
+        end_idx = min(n, i + window_size // 2 + 1)
+
+        # High confidence votes around this frame
+        neighborhood = [
+            original_types[j] for j in range(start_idx, end_idx)
+            if j != i and (not fallbacks[j] or confs[j] >= 0.50)
+        ]
+        if neighborhood:
+            most_common = Counter(neighborhood).most_common(1)[0][0]
+            if most_common != original_types[i]:
+                records[i]["road_type"]["smoothed_from"] = original_types[i]
+                records[i]["road_type"]["road_type"] = most_common
+
+
+def deduplicate_cross_view_detections(
+    frame_record: Dict[str, Any],
+    projector: EquirectangularProjector,
+    eq_w: int = 1024,
+    eq_h: int = 1024
+) -> None:
+    """
+    Identifies duplicate detections sitting across the 90° boundary seams of adjacent views.
+    Tags duplicate entries with 'cross_view_dup': True so KPI summary does not double-count them.
+    """
+    reprojected = []
+    for v in frame_record.get("views", []):
+        vname = v["view"]
+        cfg = VIEW_CONFIGS[vname]
+        for det in v.get("detections", []):
+            if "_polygon_norm" in det and len(det["_polygon_norm"]) >= 3:
+                raw_pts = np.array(det["_polygon_norm"], dtype=np.float32)
+                raw_pts[:, 0] *= projector.vw
+                raw_pts[:, 1] *= projector.vh
+                sampled_pts = []
+                for i in range(len(raw_pts)):
+                    p1 = raw_pts[i]
+                    p2 = raw_pts[(i + 1) % len(raw_pts)]
+                    for t in np.linspace(0, 1, 8, endpoint=False):
+                        sampled_pts.append(p1 * (1 - t) + p2 * t)
+                sampled_pts = np.array(sampled_pts, dtype=np.float32)
+            else:
+                ymin, xmin, ymax, xmax = det["box_1000"]
+                x1, y1 = (xmin / 1000.0) * projector.vw, (ymin / 1000.0) * projector.vh
+                x2, y2 = (xmax / 1000.0) * projector.vw, (ymax / 1000.0) * projector.vh
+                sampled_pts = []
+                for t in np.linspace(0, 1, 20, endpoint=False):
+                    sampled_pts.append([x1 + t * (x2 - x1), y1])
+                for t in np.linspace(0, 1, 20, endpoint=False):
+                    sampled_pts.append([x2, y1 + t * (y2 - y1)])
+                for t in np.linspace(0, 1, 20, endpoint=False):
+                    sampled_pts.append([x2 - t * (x2 - x1), y2])
+                for t in np.linspace(0, 1, 20, endpoint=False):
+                    sampled_pts.append([x1, y2 - t * (y2 - y1)])
+                sampled_pts = np.array(sampled_pts, dtype=np.float32)
+
+            eq_pts = projector.perspective_to_equirect_pts(sampled_pts, cfg["yaw"], cfg["pitch"], cfg["fov"], eq_w, eq_h)
+            u_min, u_max = float(np.min(eq_pts[:, 0])), float(np.max(eq_pts[:, 0]))
+            v_min, v_max = float(np.min(eq_pts[:, 1])), float(np.max(eq_pts[:, 1]))
+
+            reprojected.append({
+                "view": vname,
+                "det": det,
+                "bbox_eq": [u_min, v_min, u_max, v_max],
+                "conf": det.get("confidence", 0.0),
+                "has_mask": "_polygon_norm" in det
+            })
+
+    # Sort so confident / mask detections are kept
+    reprojected.sort(key=lambda item: (item["has_mask"], item["conf"]), reverse=True)
+
+    kept_items = []
+    for item in reprojected:
+        u1, v1, u2, v2 = item["bbox_eq"]
+        det = item["det"]
+        is_dup = False
+        for kept in kept_items:
+            if kept["view"] != item["view"] and kept["det"]["label"] == det["label"] and kept["det"].get("subtype") == det.get("subtype"):
+                ku1, kv1, ku2, kv2 = kept["bbox_eq"]
+                iu1, iv1 = max(u1, ku1), max(v1, kv1)
+                iu2, iv2 = min(u2, ku2), min(v2, kv2)
+                if iu2 > iu1 and iv2 > iv1:
+                    i_area = (iu2 - iu1) * (iv2 - iv1)
+                    item_area = max(1.0, (u2 - u1) * (v2 - v1))
+                    kept_area = max(1.0, (ku2 - ku1) * (kv2 - kv1))
+                    min_area = min(item_area, kept_area)
+                    union_area = item_area + kept_area - i_area
+                    iou = i_area / union_area if union_area > 0 else 0.0
+                    iomin = i_area / min_area if min_area > 0 else 0.0
+                    if iou > 0.15 or iomin > 0.30:
+                        is_dup = True
+                        det["cross_view_dup"] = True
+                        break
+        if not is_dup:
+            kept_items.append(item)
 
 
 # ════════════════════════════════════════════════════════════
@@ -598,6 +768,7 @@ def compute_kpi_summary(
     total_distance_m = 0.0
     road_type_distance_m = {"tar": 0.0, "cement": 0.0, "concrete": 0.0, "gravel": 0.0, "dirt": 0.0, "unknown": 0.0}
 
+    unique_tracks = {"road_damage": set(), "trash": set(), "dump": set(), "drainage": set()}
     for f in frames_data:
         rtype = f["road_type"]["road_type"].lower()
         if rtype not in road_type_frame_counts:
@@ -614,8 +785,14 @@ def compute_kpi_summary(
 
         for v in f["views"]:
             for d in v["detections"]:
+                if d.get("cross_view_dup"):
+                    continue
+
                 lbl = d["label"]
                 class_counts[lbl] = class_counts.get(lbl, 0) + 1
+                tr = d.get("track_id")
+                if tr and lbl in unique_tracks:
+                    unique_tracks[lbl].add((v["view"], tr))
 
                 if lbl == "road_damage":
                     has_rd = True
@@ -648,6 +825,7 @@ def compute_kpi_summary(
             frames_with_issues += 1
             road_type_issue_counts[rtype] += 1
 
+    track_counts = {k: len(v) for k, v in unique_tracks.items()}
     issue_rate_pct = round((frames_with_issues / total_frames) * 100.0, 1)
 
     # Village Scores (0-100 integers) (§7.2 Spec)
@@ -700,6 +878,7 @@ def compute_kpi_summary(
         "total_frames": total_frames,
         "frames_with_issues": frames_with_issues,
         "issue_rate_pct": issue_rate_pct,
+        "track_counts": track_counts,
         "class_counts": class_counts,
         "class_frame_counts": class_frame_counts,
         "drain_subtype_counts": drain_subtype_counts,
@@ -727,6 +906,12 @@ def compute_kpi_summary(
         f"    • Road Condition Score        : {road_score} / 100",
         f"    • Sanitation Score            : {sanitation_score} / 100",
         f"    • Drainage Hazard Score       : {drainage_score} / 100",
+        "------------------------------------------------------------",
+        " 📍 UNIQUE PHYSICAL HAZARDS / TRACKS:",
+        f"    • Road Damage Sites           : {track_counts.get('road_damage', 0)} distinct locations",
+        f"    • Trash Sites                 : {track_counts.get('trash', 0)} distinct trash spots",
+        f"    • Dump Sites                  : {track_counts.get('dump', 0)} distinct dump sites",
+        f"    • Drainage Channels           : {track_counts.get('drainage', 0)} open sections",
         "------------------------------------------------------------",
         " 🚘 FRAME STATISTICS:",
         f"    • Total Surveyed Frames       : {total_frames}",
@@ -813,7 +998,7 @@ def main():
     parser.add_argument("--conf-drainage", type=float, default=0.15, help="Confidence threshold for drainage (default 0.15)")
 
     # Model Weights paths
-    parser.add_argument("--classifier", default="convnext_road_model_v2.pth" if Path("convnext_road_model_v2.pth").exists() else "classifier.pt", help="Road classifier weights (.pth for ConvNeXt or .pt for MobileNet)")
+    parser.add_argument("--classifier", default="classifier.pth" if Path("classifier.pth").exists() else ("convnext_road_model_v2.pth" if Path("convnext_road_model_v2.pth").exists() else "classifier.pt"), help="Road classifier weights (.pth for ConvNeXt or .pt for MobileNet)")
     parser.add_argument("--no-noise-fallback", action="store_true",
                         help="Report 'noise' as-is instead of substituting the "
                              "runner-up class. Matches a plain argmax reference "
@@ -843,6 +1028,14 @@ def main():
 
     # Output options
     parser.add_argument("--save-views", action="store_true", help="Save individual 2D annotated perspective view crop images in output_dir/views_annotated")
+    parser.add_argument("--fill-gaps", action="store_true",
+                        help="Temporal tracking & visual gap-filling: recover momentarily dropped detections across adjacent frames")
+    parser.add_argument("--gap-size", type=int, default=2,
+                        help="Max consecutive missing frames to bridge (default 2)")
+    parser.add_argument("--min-visual-sim", type=float, default=0.40,
+                        help="Minimum visual HSV correlation threshold to confirm same object (default 0.40)")
+    parser.add_argument("--extrapolate", action="store_true", default=False,
+                        help="Enable unanchored boundary extrapolation (disabled by default to prevent false positives on good road)")
 
     args = parser.parse_args()
 
@@ -973,6 +1166,7 @@ def main():
 
     final_frame_records = []
     pending_renders = []  # populated only when --gate is active
+    last_confident_road = None
 
     for idx, frame_path in enumerate(frame_paths):
         frame_name = frame_path.name
@@ -1009,9 +1203,16 @@ def main():
         road_fallback = bool(getattr(road_pred, "fallback_used", False))
         road_primary = getattr(road_pred, "primary_class", forward_road_type)
 
+        # Noise fallback stabilization: prefer sustained confident road type over near-zero noise fallback
+        if road_fallback and forward_conf < 0.25 and last_confident_road is not None:
+            forward_road_type = last_confident_road
+        elif not road_fallback and forward_conf >= 0.50:
+            last_confident_road = forward_road_type
+
         # Step 3 — YOLO detection (Batched inference across views) (§4 Spec)
-        batch_dets_det = detector_det.predict_batch(view_images, conf_thresholds=conf_thresholds)
-        batch_dets_seg = detector_seg.predict_batch(view_images, conf_thresholds=conf_thresholds)
+        cand_floor = 0.10 if args.fill_gaps else None
+        batch_dets_det = detector_det.predict_batch(view_images, conf_thresholds=conf_thresholds, candidate_floor=cand_floor)
+        batch_dets_seg = detector_seg.predict_batch(view_images, conf_thresholds=conf_thresholds, candidate_floor=cand_floor)
 
         views_json_list = []
         all_flattened_dets_for_annotation = []
@@ -1032,7 +1233,7 @@ def main():
                     continue
                 d_box = d["box_1000"]
                 is_duplicate = False
-                for s in seg_dets:
+                for s in list(seg_dets):
                     # subtype matters: CLASS_MAP maps open_drainage and
                     # closed_drainage to the same label "drainage", so
                     # matching on label alone lets an open mask suppress a
@@ -1050,11 +1251,19 @@ def main():
                             s_area = (s_box[2] - s_box[0]) * (s_box[3] - s_box[1])
                             union_area = d_area + s_area - inter_area
                             if union_area > 0 and (inter_area / union_area) > 0.3:
-                                is_duplicate = True
-                                break
+                                if s.get("is_candidate") and not d.get("is_candidate"):
+                                    if s in view_dets:
+                                        view_dets.remove(s)
+                                    is_duplicate = False
+                                    break
+                                else:
+                                    is_duplicate = True
+                                    break
                 if not is_duplicate:
                     view_dets.append(d)
 
+            # Apply intra-view NMS to suppress duplicate overlapping boxes from the same class
+            view_dets = apply_intra_view_nms(view_dets, iou_thresh=0.65)
             view_det_counts.append(len(view_dets))
 
             spec_dets_json = []
@@ -1066,18 +1275,25 @@ def main():
                 }
                 if d.get("subtype"):
                     spec_det["subtype"] = d["subtype"]
+                if d.get("is_candidate"):
+                    spec_det["is_candidate"] = True
+                if d.get("_polygon_norm"):
+                    spec_det["_polygon_norm"] = d["_polygon_norm"]
                 spec_dets_json.append(spec_det)
 
-                all_flattened_dets_for_annotation.append((vname, d))
+                # Do NOT render unconfirmed weak candidates on initial equirect or view crops
+                if not d.get("is_candidate"):
+                    all_flattened_dets_for_annotation.append((vname, d))
 
             # Save 2D annotated perspective view crop if --save-views is enabled.
             # Under --gate the detections have not been judged yet, so the crops
             # are rendered in pass 2 instead -- otherwise the crops and the
             # stitched equirect would disagree about what was detected.
             if views_annotated_dir and not args.gate:
+                visible_dets = [d for d in view_dets if not d.get("is_candidate")]
                 view_crop_annotated = annotate_perspective_view(
                     bgr_img=view_images[v_i],
-                    detections=view_dets,
+                    detections=visible_dets,
                     road_type=forward_road_type if vname == "front" else None
                 )
                 crop_dir = views_annotated_dir / vname
@@ -1178,6 +1394,8 @@ def main():
                 })
             seq.append(frame_dets)
 
+        if gate_sequence is None:
+            raise RuntimeError("temporal_gating.py is required when using the --gate flag.")
         keep_masks, stats = gate_sequence(
             seq,
             accept_conf=args.gate_accept,
@@ -1268,12 +1486,77 @@ def main():
             else:
                 final_frame_records[i]["segment_distance_m"] = 0.0
 
+    # ── Gap-Filling (§ Temporal Multi-Object Smoothing & Interpolation) ──
+    if args.fill_gaps and len(final_frame_records) > 1:
+        logger.info(f"Applying Temporal Tracking & Visual Gap-Filling (gap_size={args.gap_size}, min_visual_sim={args.min_visual_sim})...")
+        total_filled_across_views = 0
+        for vname in selected_view_names:
+            v_seq = []
+            for f in final_frame_records:
+                v_match = next((v for v in f.get("views", []) if v.get("view") == vname), None)
+                v_seq.append(v_match.get("detections", []) if v_match else [])
+
+            # Load perspective view crop images for visual appearance verification
+            v_imgs = None
+            if views_annotated_dir and (views_annotated_dir / vname).exists():
+                v_imgs = []
+                for f in final_frame_records:
+                    stem = Path(f["frame"]).stem
+                    img_p = views_annotated_dir / vname / f"{stem}.jpg"
+                    v_imgs.append(cv2.imread(str(img_p)) if img_p.exists() else None)
+
+            interpolator = TemporalTrackInterpolator(
+                max_gap=args.gap_size,
+                min_visual_sim=args.min_visual_sim,
+                extrapolate=args.extrapolate
+            )
+            filled_seq, stats = interpolator.process_sequence(v_seq, frame_images=v_imgs)
+            n_filled = stats.get("total_interpolated_detections", 0)
+            total_filled_across_views += n_filled
+            logger.info(f"  * View [{vname:<6}]: {n_filled} dropped detections recovered (tracks: {stats.get('total_tracklets', 0)}, by label: {stats.get('by_label', {})})")
+
+            # Update final_frame_records with filled detections
+            for f_idx, f in enumerate(final_frame_records):
+                for v in f.get("views", []):
+                    if v.get("view") == vname:
+                        v["detections"] = filled_seq[f_idx]
+
+            # Re-render ONLY missed/filled boxes on perspective views if requested
+            if views_annotated_dir and (views_annotated_dir / vname).exists():
+                for f_idx, f in enumerate(final_frame_records):
+                    stem = Path(f["frame"]).stem
+                    img_p = views_annotated_dir / vname / f"{stem}.jpg"
+                    if img_p.exists():
+                        annotate_interpolated_on_image(str(img_p), str(img_p), filled_seq[f_idx])
+
+        logger.info(f"Gap-Filling Complete: Total {total_filled_across_views} missed detections recovered!")
+
+    # ── Temporal Road Surface Smoothing Pass ──
+    smooth_road_surface_sequence(final_frame_records, window_size=5)
+
+    # ── Cross-View Boundary Deduplication for JSON & KPI ──
+    for f in final_frame_records:
+        deduplicate_cross_view_detections(f, projector)
+
     # Step 7 — Save final JSON & KPI outputs (§7 Spec)
     # Sort frames in strict filename order
     final_frame_records.sort(key=lambda x: x["frame"])
 
     detections_json_file = output_dir / f"{args.village}_detections.json"
-    detections_payload = {"frames": final_frame_records}
+    clean_frames = []
+    for f in final_frame_records:
+        cf = {k: v for k, v in f.items() if not k.startswith("_")}
+        cf_views = []
+        for v in f.get("views", []):
+            cv = {k: val for k, val in v.items() if not k.startswith("_")}
+            clean_dets = []
+            for d in v.get("detections", []):
+                clean_dets.append({k: val for k, val in d.items() if not k.startswith("_")})
+            cv["detections"] = clean_dets
+            cf_views.append(cv)
+        cf["views"] = cf_views
+        clean_frames.append(cf)
+    detections_payload = {"frames": clean_frames}
     detections_json_file.write_text(json.dumps(detections_payload, indent=2), encoding="utf-8")
     logger.info(f"Saved Detections JSON: {detections_json_file.resolve()}")
 
@@ -1295,7 +1578,7 @@ def main():
     logger.info(f"Saved KPI Summary Text: {kpi_txt_file.resolve()}")
 
     print("\n" + kpi_txt)
-    logger.info("✨ Pipeline Execution Successfully Finished!")
+    logger.info("[SUCCESS] Pipeline Execution Successfully Finished!")
 
 
 if __name__ == "__main__":
