@@ -1,0 +1,27 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch, YOLO, and Hugging Face model weight files (exclude all binary weights)
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.onnx
+
+# Survey output directories
+outputs/
+outputs*/
+
+# Local backup folders
+backup/
+backup*/
+
+# Standalone unused scripts
+track_interpolator.py
+
+# System & log files
+*.log
+.DS_Store
+Thumbs.db

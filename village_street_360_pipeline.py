@@ -841,6 +841,266 @@ class RoadTypeClassifier:
 
 
 # ---------------------------------------------------------------------------
+# Stage 1.5: Forward-View Road Boundary & Drivable Corridor Extractor
+# ---------------------------------------------------------------------------
+
+class RoadBoundarySegmenter:
+    """
+    Identifies the exact drivable road boundary in the forward perspective view
+    (1024x1024, pitch=-20°, fov=100°) using SegFormer ADE20K semantic segmentation
+    combined with a geometric perspective corridor prior and ground contiguity anchoring.
+    """
+
+    # ADE20K 0-based class indices for drivable surfaces:
+    # 6: road/route, 11: sidewalk/pavement, 13: earth/ground, 29: field/mud, 52: path, 91: dirt track
+    ADE20K_PAVED_ROAD_CLASSES = {6, 11, 13, 52, 91}
+    ADE20K_UNPAVED_ROAD_CLASSES = {6, 11, 13, 29, 52, 91}
+    # Non-road vertical structures, obstacles, vegetation, and platforms to strictly eliminate
+    ADE20K_OBSTACLE_CLASSES = {0, 1, 2, 4, 12, 15, 17, 20, 69, 104}
+
+    DEFAULT_MODEL_DIR = Path(__file__).resolve().parent / "models" / "segformer_b0"
+
+    def __init__(
+        self,
+        road_seg_weights: Optional[str] = None,
+        device: str = "cpu",
+        min_overlap_ratio: float = 0.25,
+    ) -> None:
+        self.device = device
+        self.min_overlap_ratio = min_overlap_ratio
+        self.model: Any = None
+        self.processor: Any = None
+        self.last_pred_cls: Optional[np.ndarray] = None
+
+        weights_str = str(road_seg_weights or "").strip()
+        has_local_weights = (
+            self.DEFAULT_MODEL_DIR.is_dir()
+            and any((self.DEFAULT_MODEL_DIR / f).is_file() for f in ("model.safetensors", "pytorch_model.bin"))
+        )
+        # Default to inbuilt project models directory if local weights are present
+        if not weights_str or weights_str in ("models/segformer_b0", "nvidia/segformer-b0-finetuned-ade-512-512"):
+            if has_local_weights:
+                weights_str = str(self.DEFAULT_MODEL_DIR)
+            else:
+                weights_str = "nvidia/segformer-b0-finetuned-ade-512-512"
+        elif not Path(weights_str).is_dir() and has_local_weights and Path(weights_str).name == "segformer_b0":
+            weights_str = str(self.DEFAULT_MODEL_DIR)
+
+        self._load_model(weights_str)
+
+    def _load_model(self, weights_spec: str) -> None:
+        from transformers import AutoImageProcessor, SegformerForSemanticSegmentation
+
+        is_local = (
+            Path(weights_spec).is_dir()
+            and any((Path(weights_spec) / f).is_file() for f in ("model.safetensors", "pytorch_model.bin"))
+        )
+        self.processor = AutoImageProcessor.from_pretrained(weights_spec, local_files_only=is_local)
+        self.model = SegformerForSemanticSegmentation.from_pretrained(weights_spec, local_files_only=is_local).to(self.device).eval()
+        logger.info("Loaded SegFormer Road Boundary model: %s (inbuilt_local=%s) on %s", weights_spec, is_local, self.device)
+
+    @staticmethod
+    def _build_perspective_prior_mask(h: int, w: int) -> np.ndarray:
+        """
+        Builds a perspective trapezoid mask for 100° FOV at -20° pitch.
+        Accurately bounds the forward drivable corridor while excluding upper sky,
+        house walls, and extreme off-road shoulder construction piles.
+        """
+        mask = np.zeros((h, w), dtype=np.uint8)
+        poly = np.array(
+            [
+                [int(w * 0.28), int(h * 0.42)],  # Top-left near horizon
+                [int(w * 0.72), int(h * 0.42)],  # Top-right near horizon
+                [int(w * 0.90), int(h * 0.80)],  # Mid-bottom right
+                [int(w * 0.86), h - 1],          # Bottom-right
+                [int(w * 0.14), h - 1],          # Bottom-left
+                [int(w * 0.10), int(h * 0.80)],  # Mid-bottom left
+            ],
+            dtype=np.int32,
+        )
+        cv2.fillPoly(mask, [poly], 255)
+        return mask
+
+    def get_road_mask(
+        self,
+        front_img: np.ndarray,
+        is_paved: bool = True,
+        drainage_detections: Optional[List[HazardDetection]] = None,
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        h, w = front_img.shape[:2]
+        prior_mask = self._build_perspective_prior_mask(h, w)
+        self.last_pred_cls = None
+
+        import torch
+        import torch.nn.functional as F
+
+        rgb = cv2.cvtColor(front_img, cv2.COLOR_BGR2RGB)
+        inputs = self.processor(images=rgb, return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            logits = F.interpolate(outputs.logits, size=(h, w), mode="bilinear", align_corners=False)
+            pred_cls = logits.argmax(dim=1)[0].cpu().numpy()
+        self.last_pred_cls = pred_cls
+
+        target_classes = self.ADE20K_PAVED_ROAD_CLASSES if is_paved else self.ADE20K_UNPAVED_ROAD_CLASSES
+        raw_road = np.isin(pred_cls, list(target_classes)).astype(np.uint8) * 255
+
+        # Strictly zero out known obstacle classes (walls, buildings, sky, trees, platforms, fences)
+        obstacle_mask = np.isin(pred_cls, list(self.ADE20K_OBSTACLE_CLASSES))
+        raw_road[obstacle_mask] = 0
+
+        road_mask = cv2.bitwise_and(raw_road, prior_mask)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+        road_mask = cv2.morphologyEx(road_mask, cv2.MORPH_CLOSE, kernel)
+
+        # Ground-anchored contour filtering: keep all valid road contours that touch the lower ground region
+        cnts_ext, _ = cv2.findContours(road_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        filled_road = np.zeros_like(road_mask)
+        for c in cnts_ext:
+            area = cv2.contourArea(c)
+            if area > (0.015 * h * w):
+                x, y, cw, ch = cv2.boundingRect(c)
+                # Contour must extend down to the ground road surface (lower 40% of frame)
+                if (y + ch) >= int(0.60 * h):
+                    cv2.fillPoly(filled_road, [c], 255)
+
+        # Safety Fallback on Paved Roads: If SegFormer produces insufficient coverage (<2%),
+        # fall back to the perspective corridor trapezoid minus known obstacles so real cracks are NEVER missed
+        if is_paved and np.count_nonzero(filled_road) < (0.02 * h * w):
+            filled_road = prior_mask.copy()
+            if self.last_pred_cls is not None:
+                obs_mask = np.isin(self.last_pred_cls, list(self.ADE20K_OBSTACLE_CLASSES))
+                filled_road[obs_mask] = 0
+
+        road_mask = filled_road
+
+        # Subtract open drainage if detected
+        if drainage_detections:
+            for d in drainage_detections:
+                if d.class_name == "open_drainage" and d.mask_polygon and len(d.mask_polygon) >= 3:
+                    cv2.fillPoly(road_mask, [np.array(d.mask_polygon, dtype=np.int32)], 0)
+
+        cnts, _ = cv2.findContours(road_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boundary_poly = None
+        if cnts:
+            largest = max(cnts, key=cv2.contourArea)
+            if cv2.contourArea(largest) > (0.04 * h * w):
+                boundary_poly = cv2.approxPolyDP(largest, 0.005 * cv2.arcLength(largest, True), True).reshape(-1, 2)
+
+        return road_mask, boundary_poly
+
+    def is_defect_inside_road(
+        self,
+        det: HazardDetection,
+        road_mask: np.ndarray,
+        is_paved: bool = True,
+    ) -> bool:
+        if det.class_name not in ("road_damage", "pothole"):
+            return True
+
+        # RULE 1: Dirt / Unpaved Road Physical Constraints
+        # Pavement distress cracks cannot physically exist on unpaved dirt surfaces
+        if not is_paved:
+            if det.class_name == "road_damage":
+                logger.info(
+                    "Suppressed crack on unpaved/dirt surface: %s [%s] at bbox=%s",
+                    det.class_name,
+                    det.subtype or "None",
+                    det.bbox_xyxy,
+                )
+                return False
+            if det.class_name == "pothole" and det.confidence < 0.40:
+                logger.info(
+                    "Suppressed low-confidence unpaved pothole: conf=%.2f at bbox=%s",
+                    det.confidence,
+                    det.bbox_xyxy,
+                )
+                return False
+
+        h, w = road_mask.shape[:2]
+        cx = int((det.bbox_xyxy[0] + det.bbox_xyxy[2]) * 0.5)
+        cy = int((det.bbox_xyxy[1] + det.bbox_xyxy[3]) * 0.5)
+        cx = max(0, min(w - 1, cx))
+        cy = max(0, min(h - 1, cy))
+
+        # RULE 2: Obstacle Class Rejection (Eliminates house walls, temple platforms, trees, fences)
+        if self.last_pred_cls is not None and 0 <= cy < h and 0 <= cx < w:
+            center_cls = int(self.last_pred_cls[cy, cx])
+            # On paved roads, grey concrete slabs can have semantic confusion with class 0 (wall) or 1 (building),
+            # so only veto on strict non-road obstacles (sky, trees, platforms, fences, poles)
+            strict_obstacles = (
+                self.ADE20K_OBSTACLE_CLASSES if not is_paved else (self.ADE20K_OBSTACLE_CLASSES - {0, 1})
+            )
+            if center_cls in strict_obstacles:
+                logger.info(
+                    "Dropped defect on obstacle class %d: %s [%s] at bbox=%s",
+                    center_cls,
+                    det.class_name,
+                    det.subtype or "None",
+                    det.bbox_xyxy,
+                )
+                return False
+
+        if np.count_nonzero(road_mask) < (0.02 * h * w):
+            return False
+
+        effective_thresh = min(self.min_overlap_ratio, 0.20)
+
+        if det.mask_polygon and len(det.mask_polygon) >= 3:
+            pts = np.array(det.mask_polygon, dtype=np.int32)
+            x1 = max(0, int(np.min(pts[:, 0])))
+            y1 = max(0, int(np.min(pts[:, 1])))
+            x2 = min(w, int(np.max(pts[:, 0])) + 1)
+            y2 = min(h, int(np.max(pts[:, 1])) + 1)
+            if x2 <= x1 or y2 <= y1:
+                return False
+
+            local_det_mask = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
+            shifted_pts = pts - np.array([[x1, y1]], dtype=np.int32)
+            cv2.fillPoly(local_det_mask, [shifted_pts], 255)
+
+            det_pixels = int(np.count_nonzero(local_det_mask))
+            if det_pixels == 0:
+                return False
+
+            road_crop = road_mask[y1:y2, x1:x2]
+            inside_pixels = int(np.count_nonzero((local_det_mask > 0) & (road_crop > 0)))
+            overlap_ratio = inside_pixels / float(det_pixels)
+        else:
+            x1, y1, x2, y2 = [
+                max(0, min(w - 1, det.bbox_xyxy[0])),
+                max(0, min(h - 1, det.bbox_xyxy[1])),
+                max(0, min(w, det.bbox_xyxy[2])),
+                max(0, min(h, det.bbox_xyxy[3])),
+            ]
+            if x2 <= x1 or y2 <= y1:
+                return False
+            road_crop = road_mask[y1:y2, x1:x2]
+            overlap_ratio = float(np.count_nonzero(road_crop)) / float((y2 - y1) * (x2 - x1))
+
+        anchor_inside = bool(road_mask[min(h - 1, cy), min(w - 1, cx)] > 0)
+        bottom_anchor_inside = bool(road_mask[min(h - 1, int(det.bbox_xyxy[3]) - 2), min(w - 1, cx)] > 0)
+
+        if is_paved:
+            is_crack = (
+                det.subtype in ("Alligator Crack", "Longitudinal Crack", "Transverse Crack")
+                or (det.class_name == "road_damage" and det.confidence >= 0.20)
+            )
+            is_weak_untyped = (det.subtype is None and det.confidence < 0.20)
+            if is_weak_untyped:
+                # Require center anchor for weak edge detections (e.g. sand heaps on shoulders)
+                return anchor_inside and (overlap_ratio >= 0.25)
+
+            return (
+                (overlap_ratio >= effective_thresh)
+                or (anchor_inside and overlap_ratio >= 0.12)
+                or (is_crack and bottom_anchor_inside and overlap_ratio >= 0.10)
+            )
+        else:
+            return anchor_inside and (overlap_ratio >= 0.30)
+
+
+# ---------------------------------------------------------------------------
 # Stage 2, 3 & 4: Unified Multi-Model Hazard Pipeline
 # ---------------------------------------------------------------------------
 
@@ -867,6 +1127,8 @@ class VillageStreetHazardPipeline:
         conf_road_unpaved: float = 0.20,
         enable_road_tiling: bool = True,
         apply_clahe: bool = False,
+        road_seg_weights: Optional[str] = "adaptive",
+        min_road_overlap: float = 0.50,
     ) -> None:
         from ultralytics import YOLO
 
@@ -878,6 +1140,15 @@ class VillageStreetHazardPipeline:
         self.conf_road_unpaved = conf_road_unpaved
         self.enable_road_tiling = enable_road_tiling
         self.apply_clahe = apply_clahe
+
+        if road_seg_weights and str(road_seg_weights).strip().lower() not in ("none", "null", "false", "off"):
+            self.road_boundary_segmenter: Optional[RoadBoundarySegmenter] = RoadBoundarySegmenter(
+                road_seg_weights=road_seg_weights,
+                device=self.device,
+                min_overlap_ratio=min_road_overlap,
+            )
+        else:
+            self.road_boundary_segmenter = None
         self.classifier = classifier
 
         self.detector_model = YOLO(detector_weights) if detector_weights and Path(detector_weights).is_file() else None
@@ -1171,7 +1442,11 @@ class VillageStreetHazardPipeline:
             for xyxy, conf, cls_id in zip(xyxy_arr, conf_arr, cls_arr):
                 cls_name = self.rdd_model.names.get(cls_id, str(cls_id))
                 is_pothole = (cls_id == 3 or "pothole" in cls_name.lower())
-                req_conf = pothole_conf_thresh if is_pothole else road_conf_thresh
+                # On unpaved/dirt roads, cracks cannot physically exist; only potholes are valid
+                if not is_paved and not is_pothole:
+                    continue
+                # On unpaved roads, potholes require strict confidence >= 0.40 to prevent dirt mound false positives
+                req_conf = (0.40 if not is_paved else pothole_conf_thresh) if is_pothole else road_conf_thresh
                 if conf < req_conf:
                     continue
 
@@ -1378,14 +1653,17 @@ class VillageStreetHazardPipeline:
         for view_name, view_img in views.items():
             is_forward = view_name.lower() in ("front", "front_0deg", "forward")
 
+            # Cracks cannot physically exist on unpaved dirt surfaces; only allow road damage on paved forward views
+            allow_road_damage_view = (is_forward and is_paved)
+
             det_dets = self._run_detector_on_view(
-                view_name, view_img, road_conf_thresh, allow_road_damage=is_forward
+                view_name, view_img, road_conf_thresh, allow_road_damage=allow_road_damage_view
             )
             seg_dets = self._run_segmenter_on_view(
                 view_name,
                 view_img,
                 road_conf_thresh,
-                allow_road_damage=is_forward,
+                allow_road_damage=allow_road_damage_view,
                 enable_tiling=(self.enable_road_tiling and is_forward),
             )
             rdd_dets = self._run_rdd_on_view(
@@ -1402,6 +1680,28 @@ class VillageStreetHazardPipeline:
             # Deduplicate view detections with IoU + IoMin containment fusion
             combined_candidates = waste_dets + seg_dets + masked_defects
             view_dets = self._deduplicate_detections(combined_candidates, iou_threshold=0.40, iomin_threshold=0.55)
+
+            # Filter out road damage & potholes outside the drivable road boundary in forward view
+            if is_forward and self.road_boundary_segmenter is not None:
+                drainage_dets = [d for d in view_dets if d.class_name == "open_drainage"]
+                road_mask, road_poly = self.road_boundary_segmenter.get_road_mask(
+                    view_img, is_paved=is_paved, drainage_detections=drainage_dets
+                )
+                filtered_view_dets: List[HazardDetection] = []
+                for d in view_dets:
+                    if d.class_name in ("road_damage", "pothole"):
+                        if self.road_boundary_segmenter.is_defect_inside_road(d, road_mask, is_paved=is_paved):
+                            filtered_view_dets.append(d)
+                        else:
+                            logger.info(
+                                "Dropped out-of-road defect: %s [%s] at bbox=%s",
+                                d.class_name,
+                                d.subtype or "None",
+                                d.bbox_xyxy,
+                            )
+                    else:
+                        filtered_view_dets.append(d)
+                view_dets = filtered_view_dets
 
             all_detections.extend(view_dets)
             annotated_views[view_name] = self.draw_view_annotations(
@@ -1745,6 +2045,20 @@ def parse_args() -> argparse.Namespace:
         help="Confidence threshold for trash/dump waste detection (default: 0.25).",
     )
     parser.add_argument(
+        "--road-boundary",
+        "--road-seg-weights",
+        dest="road_seg_weights",
+        type=str,
+        default="models/segformer_b0",
+        help="Road boundary segmenter mode/weights: local folder path (default: models/segformer_b0), SegFormer HF name, or 'none' to disable.",
+    )
+    parser.add_argument(
+        "--min-road-overlap",
+        type=float,
+        default=0.25,
+        help="Minimum overlap ratio of defect inside the drivable road boundary (default: 0.25).",
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default="outputs/village_street_inspection",
@@ -1982,6 +2296,8 @@ def main() -> None:
         conf_road_unpaved=args.conf_road_unpaved,
         enable_road_tiling=not args.no_tiling,
         apply_clahe=args.apply_clahe,
+        road_seg_weights=args.road_seg_weights,
+        min_road_overlap=args.min_road_overlap,
     )
 
     source_path = Path(args.source)
