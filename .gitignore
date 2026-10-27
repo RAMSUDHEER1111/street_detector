@@ -20,8 +20,15 @@ backup*/
 
 # Standalone unused scripts
 track_interpolator.py
+inference_engine.py
+main.py
+
+# Local backup files & documentation
+village_street_360_pipeline_backup.py
+pipeline_architecture_and_implementation_guide.md
 
 # System & log files
 *.log
 .DS_Store
 Thumbs.db
+
